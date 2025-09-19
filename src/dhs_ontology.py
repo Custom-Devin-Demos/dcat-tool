@@ -19,6 +19,8 @@ import json
 from dateutil.parser import parse
 from pyshacl import validate
 from datetime import datetime
+import hashlib
+import pickle
 
 import template_reader
 import easy_workbook
@@ -81,6 +83,31 @@ WHERE {
 }
 """
 
+def generate_cache_key(schemata_dir, schema_file, query=None):
+    """Generate a cache key based on file timestamps and query hash"""
+    query_hash = hashlib.sha256(query.encode()).hexdigest() if query else ""
+    
+    timestamps = []
+    for fname in glob.glob(os.path.join(schemata_dir, "*.ttl")) + [schema_file]:
+        if fname and os.path.exists(fname):
+            timestamps.append((fname, os.path.getmtime(fname)))
+    
+    timestamps.sort()
+    
+    key_str = query_hash + str(timestamps)
+    return hashlib.sha256(key_str.encode()).hexdigest()
+
+def is_cache_valid(cache_metadata, schemata_dir, schema_file, query=None):
+    """Verify cache is still valid based on file timestamps and query hash"""
+    for fname, mtime in cache_metadata['files']:
+        if not os.path.exists(fname) or os.path.getmtime(fname) != mtime:
+            return False
+    
+    if query and cache_metadata.get('query_hash') != hashlib.sha256(query.encode()).hexdigest():
+        return False
+    
+    return True
+
 def dhs_collect_graph(schema_file = COLLECT_TTL):
     g    = Graph()
     g.parse(schema_file, format='turtle')
@@ -88,15 +115,47 @@ def dhs_collect_graph(schema_file = COLLECT_TTL):
 
 def dcatv3_ontology(schemata_dir = SCHEMATA_DIR, schema_file = COLLECT_TTL):
     """Returns a graph of the DHS ontology for the data inventory program"""
-    g    = Graph()
-    seen = set()
-    for fname in glob.glob( os.path.join(schemata_dir,"*.ttl")) + [schema_file]:
-        if fname and fname not in seen:
+    cache_path = os.path.join(schemata_dir, "schema_cache.pickle")
+    
+    files_info = []
+    for fname in glob.glob(os.path.join(schemata_dir, "*.ttl")) + [schema_file]:
+        if fname and os.path.exists(fname):
             fname = os.path.abspath(fname)
-            g.parse(fname, format='turtle')
-            seen.add(fname)
-    if not seen:
+            files_info.append((fname, os.path.getmtime(fname)))
+    
+    if not files_info:
         raise RuntimeError("No schema files specified")
+    
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                cache_data = pickle.load(f)
+                
+            if is_cache_valid(cache_data['metadata'], schemata_dir, schema_file):
+                return cache_data['graph']
+        except (pickle.PickleError, KeyError, EOFError):
+            pass
+    
+    g = Graph()
+    seen = set()
+    for fname, _ in files_info:
+        g.parse(fname, format='turtle')
+        seen.add(fname)
+    
+    cache_data = {
+        'graph': g,
+        'metadata': {
+            'files': files_info,
+            'timestamp': datetime.now()
+        }
+    }
+    
+    try:
+        with open(cache_path, 'wb') as f:
+            pickle.dump(cache_data, f)
+    except (IOError, pickle.PickleError):
+        pass
+    
     return g
 
 class Simplifier:
@@ -136,10 +195,54 @@ class ValidationFail( Exception ):
 class Validator:
     def __init__(self, schemata_dir = SCHEMATA_DIR, schema_file = COLLECT_TTL, debug=False):
         self.debug = debug
+        self.schemata_dir = schemata_dir
+        self.schema_file = schema_file
         self.g = dcatv3_ontology(schemata_dir, schema_file)
-        self.get_template_column_info_objs()
+        
+        query_cache_path = os.path.join(schemata_dir, "query_results_cache.pickle")
+        query_hash = hashlib.sha256(CI_QUERY.encode()).hexdigest()
+        
+        cache_valid = False
+        if os.path.exists(query_cache_path):
+            try:
+                with open(query_cache_path, 'rb') as f:
+                    cache_data = pickle.load(f)
+                
+                if (cache_data.get('query_hash') == query_hash and 
+                    is_cache_valid(cache_data.get('metadata', {}), schemata_dir, schema_file)):
+                    self.ci_objs = cache_data.get('ci_objs', [])
+                    self.g2 = cache_data.get('g2')
+                    cache_valid = True
+            except (pickle.PickleError, KeyError, EOFError):
+                pass
+        
+        if not cache_valid:
+            self.get_template_column_info_objs()
+            
+            files_info = []
+            for fname in glob.glob(os.path.join(schemata_dir, "*.ttl")) + [schema_file]:
+                if fname and os.path.exists(fname):
+                    fname = os.path.abspath(fname)
+                    files_info.append((fname, os.path.getmtime(fname)))
+            
+            cache_data = {
+                'query_hash': query_hash,
+                'ci_objs': self.ci_objs,
+                'g2': self.g2,
+                'metadata': {
+                    'files': files_info,
+                    'timestamp': datetime.now()
+                }
+            }
+            
+            try:
+                with open(query_cache_path, 'wb') as f:
+                    pickle.dump(cache_data, f)
+            except (IOError, pickle.PickleError):
+                pass
+        
         self.seenIDs = set()
-        self.rows    = []
+        self.rows = []
 
     def clear(self):
         """Clear the seenIDs"""
